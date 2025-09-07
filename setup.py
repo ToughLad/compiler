@@ -13,7 +13,7 @@ setup(
     description="Thrift IDL extractor and compiler for LINE APK decompiled sources",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/line/thrift-compiler",
+    url="https://github.com/toughlad/compiler",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     classifiers=[
