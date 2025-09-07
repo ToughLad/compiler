@@ -141,3 +141,41 @@ public class E0 implements org.apache.thrift.d {
         # Check obfuscated response
         assert 'struct GetUsersResponse {' in content
         assert '1: list<User> users' in content
+
+
+class TestIntegrationSmoke:
+    """Smoke integration test to ensure end-to-end run works and reports are generated."""
+    
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.java_root = Path(self.temp_dir) / 'sources'
+        self.java_root.mkdir()
+        self.output_file = Path(self.temp_dir) / 'output.thrift'
+
+    def teardown_method(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def create_java_file(self, rel_path: str, content: str) -> Path:
+        p = self.java_root / rel_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        return p
+
+    def test_smoke_main(self, monkeypatch):
+        # Point compiler to temp paths
+        monkeypatch.setattr(thrift_compiler, 'JAVA_ROOT', self.java_root, raising=False)
+        monkeypatch.setattr(thrift_compiler, 'OUTPUT_FILE', self.output_file, raising=False)
+
+        # Minimal inputs to avoid empty output
+        self.create_java_file('enums/Status.java', 'public enum Status { ACTIVE(1), INACTIVE(2) }')
+        self.create_java_file('structs/User.java', 'public class User implements org.apache.thrift.k { }')
+        self.create_java_file('services/UserService.java', 'public class UserService {}')
+        self.create_java_file('services/UserService$Client.java', 'public static class Client { public final void ping(User u){ b("ping"); } }')
+
+        # Run compiler
+        thrift_compiler.main()
+
+        # Verify outputs
+        assert self.output_file.exists()
+        assert self.output_file.with_suffix('.report.json').exists()
+        assert self.output_file.with_suffix('.report.txt').exists()
