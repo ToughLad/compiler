@@ -10,6 +10,36 @@ from collections import defaultdict
 import json
 from datetime import datetime
 
+# Thrift reserved keywords that must be escaped
+THRIFT_RESERVED = {
+    'binary', 'bool', 'byte', 'const', 'double', 'enum', 'exception', 'extends',
+    'false', 'i16', 'i32', 'i64', 'i8', 'include', 'list', 'map', 'namespace', 'oneway',
+    'optional', 'required', 'service', 'set', 'string', 'struct', 'throws', 'true',
+    'typedef', 'union', 'void', 'slist', 'senum', 'cpp_include', 'cpp_type',
+    'java_package', 'cocoa_prefix', 'csharp_namespace', 'delphi_namespace',
+    'php_namespace', 'py_module', 'perl_package', 'ruby_namespace', 'smalltalk_category',
+    'smalltalk_prefix', 'xsd_all', 'xsd_optional', 'xsd_nillable', 'xsd_namespace',
+    'xsd_attrs', 'async'
+}
+
+def escape_reserved(name):
+    """Escape Thrift reserved keywords and invalid identifiers."""
+    if not name:
+        return 'unknown'
+    # Check if name starts with a number
+    if name[0].isdigit():
+        name = 'n_' + name  # Prefix with 'n_' for numeric start
+    # Check if it's a reserved keyword
+    if name.lower() in THRIFT_RESERVED:
+        return name + '_'
+    # Ensure it's a valid identifier
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        # Replace invalid chars with underscore
+        name = re.sub(r'[^A-Za-z0-9_]', '_', name)
+        if name[0].isdigit():
+            name = 'n_' + name
+    return name
+
 # Configuration (patch-friendly for tests)
 JAVA_ROOT = globals().get('JAVA_ROOT', Path('/workspaces/LINE/line_decompiled/sources'))
 OUTPUT_FILE = globals().get('OUTPUT_FILE', Path('/workspaces/LINE/line.thrift'))
@@ -59,7 +89,7 @@ re_b_only = re.compile(r'\bb\("([A-Za-z0-9_]+)"\)')
 
 # Type mapping
 TYPE_MAP = {
-    1: 'bool', 2: 'bool', 3: 'byte', 4: 'double', 6: 'i16', 8: 'i32', 10: 'i64',
+    1: 'bool', 2: 'bool', 3: 'i8', 4: 'double', 6: 'i16', 8: 'i32', 10: 'i64',
     11: 'string', 12: 'struct', 13: 'map', 14: 'set', 15: 'list', 16: 'enum'
 }
 
@@ -115,6 +145,9 @@ exception_structs = set()
 class_index = {}
 alias_map = {}
 response_map = {}
+exception_name_alias = {}  # original simple name -> emitted exception name
+emitted_exception_names = set()  # set of emitted exception type names
+global_type_names = set()  # Track ALL type names (enums, structs, services) globally to prevent duplicates
 
 def read_file(p):
     try:
@@ -126,11 +159,27 @@ def read_file(p):
 def _primitive_to_thrift(t: str) -> str:
     if not t:
         return t
+    # Clean up malformed types
+    if '...' in str(t):
+        return 'binary'  # Default for malformed types
+    if '.' in str(t) and not t.startswith('java.'):
+        # Keep only the last part after dots (unless it's a package name)
+        t = t.split('.')[-1]
     mapping = {
+        # primitives
         'long': 'i64', 'int': 'i32', 'short': 'i16', 'double': 'double', 'float': 'double',
-        'boolean': 'bool', 'byte': 'byte', 'String': 'string', 'void': 'void', 'binary': 'binary'
+        'boolean': 'bool', 'byte': 'i8', 'string': 'string', 'void': 'void', 'binary': 'binary',
+        # Boxed/Capitalized Java types
+        'Long': 'i64', 'Integer': 'i32', 'Short': 'i16', 'Double': 'double', 'Float': 'double',
+        'Boolean': 'bool', 'Byte': 'i8', 'String': 'string', 'Character': 'i16',
+        # Common binary-like representations
+        'Object': 'binary', 'byte[]': 'binary', 'ByteBuffer': 'binary'
     }
-    return mapping.get(t, t)
+    result = mapping.get(t, t)
+    # Validate the result is a valid Thrift identifier
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', result):
+        return 'binary'  # Default for invalid identifiers
+    return result
 
 def normalize_type_name(t):
     """Return a simplified, normalized Java type name.
@@ -199,6 +248,8 @@ def camel_case(snake_str):
 
 def parse_enums():
     print("Parsing enums...")
+    global global_type_names
+    global_type_names.clear()  # Start fresh
     for p in JAVA_ROOT.rglob('*.java'):
         s = read_file(p)
         m = re_class_enum.search(s)
@@ -242,12 +293,16 @@ def parse_enums():
                     if n in existing:
                         continue
                     existing.add(n)
+                global_type_names.add(name)  # Track enum names
                 enums[name] = en
 
 def parse_structs():
     print("Parsing structs...")
-    # First pass: build map of obfuscated names to real Response/Request names
     obfuscated_map = {}
+    global global_type_names  # Use the global set
+    # Don't clear - we need enum names from parse_enums()
+    
+    # First pass: find all obfuscated classes that have Response/Request toString methods
     for p in JAVA_ROOT.rglob('*.java'):
         s = read_file(p)
         # Look for toString() that returns Response/Request names (including with fields)
@@ -369,7 +424,7 @@ def parse_structs():
             vt = vt.strip()
             mapping = {
                 'long': 'i64', 'int': 'i32', 'short': 'i16', 'double': 'double', 'float': 'double',
-                'boolean': 'bool', 'byte': 'byte', 'String': 'string', 'Integer': 'i32'
+                'boolean': 'bool', 'byte': 'i8', 'String': 'string', 'Integer': 'i32'
             }
             return mapping.get(vt)
 
@@ -477,12 +532,34 @@ def parse_structs():
                 resolved_type = val_type
             if thrift_type == 'map' and val_type and not resolved_type:
                 resolved_type = val_type
+            # Thrift doesn't allow field ID 0, so shift to 1 if needed
+            if fid <= 0:
+                fid = max(1, fid + 1)
             field = Field(id=fid, name=fname, ttype=thrift_type, type_name=resolved_type, 
                          key_type=key_type, val_type=val_type, required=False)
             ts.fields.append(field)
         # Add structs that implement thrift (even if empty) and any Response/Request types
         if m or ts.fields or class_name.endswith('Response') or class_name.endswith('Request'):
+            # Ensure globally unique struct names (no collision with enums/services)
+            original_name = class_name
+            if class_name in global_type_names or class_name in structs:
+                suffix = 2
+                while (f"{original_name}_{suffix}" in global_type_names or 
+                       f"{original_name}_{suffix}" in structs):
+                    suffix += 1
+                class_name = f"{original_name}_{suffix}"
+                ts.name = class_name  # Update the struct's name too
+            global_type_names.add(class_name)
             structs[class_name] = ts
+            # Track exception rename mapping and emitted exception names
+            is_exception = (original_name in exception_structs) or original_name.endswith('Exception') or class_name.endswith('Exception')
+            if is_exception:
+                # Map original simple name to the emitted name
+                exception_name_alias[original_name] = class_name
+                # Track emitted exception names for validation later
+                emitted_exception_names.add(class_name)
+                # Ensure the emitted name is treated as an exception kind when writing
+                exception_structs.add(class_name)
             # Debug: track obfuscated classes
             if use_obfuscated_name and ts.fields:
                 print(f"  Added obfuscated class: {p.stem} -> {class_name} with {len(ts.fields)} fields")
@@ -715,9 +792,16 @@ def parse_services():
             tag = method_tag or method_name
             names.add(tag)
             if arg_sig:
-                method_to_arg[tag] = _primitive_to_thrift(normalize_type_name(arg_sig) or arg_sig)
+                # Clean up the argument signature
+                cleaned_arg = normalize_type_name(arg_sig) or arg_sig
+                if '...' in str(cleaned_arg) or not re.match(r'^[A-Za-z_][A-Za-z0-9_.<>\[\]]*$', str(cleaned_arg)):
+                    cleaned_arg = 'binary'
+                method_to_arg[tag] = _primitive_to_thrift(cleaned_arg)
             if ret_sig:
-                method_to_ret_ex[tag] = (_primitive_to_thrift(normalize_type_name(ret_sig) or ret_sig), None)
+                cleaned_ret = normalize_type_name(ret_sig) or ret_sig
+                if '...' in str(cleaned_ret) or not re.match(r'^[A-Za-z_][A-Za-z0-9_.<>\[\]]*$', str(cleaned_ret)):
+                    cleaned_ret = 'binary'
+                method_to_ret_ex[tag] = (_primitive_to_thrift(cleaned_ret), None)
 
         # Fallback: signature scan independent of b("...") capture
         sig_re = re.compile(r'public\s+final\s+([A-Za-z0-9_\.<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)')
@@ -735,10 +819,19 @@ def parse_services():
                 else:
                     tok = first
                 arg_sig = tok
+                # Clean up malformed types
+                if '...' in arg_sig:
+                    arg_sig = 'binary'
             if arg_sig:
-                method_to_arg[tag] = _primitive_to_thrift(normalize_type_name(arg_sig) or arg_sig)
+                cleaned_arg = normalize_type_name(arg_sig) or arg_sig
+                if '...' in str(cleaned_arg) or not re.match(r'^[A-Za-z_][A-Za-z0-9_.<>\[\]]*$', str(cleaned_arg)):
+                    cleaned_arg = 'binary'
+                method_to_arg[tag] = _primitive_to_thrift(cleaned_arg)
             if ret_sig:
-                method_to_ret_ex[tag] = (_primitive_to_thrift(normalize_type_name(ret_sig) or ret_sig), None)
+                cleaned_ret = normalize_type_name(ret_sig) or ret_sig  
+                if '...' in str(cleaned_ret) or not re.match(r'^[A-Za-z_][A-Za-z0-9_.<>\[\]]*$', str(cleaned_ret)):
+                    cleaned_ret = 'binary'
+                method_to_ret_ex[tag] = (_primitive_to_thrift(cleaned_ret), None)
         # Fallback: pick up method tags from b("...") calls
         for bm in re_b_only.finditer(s):
             names.add(bm.group(1))
@@ -816,6 +909,15 @@ def parse_services():
             
             svc.add_method(mname, arg_type, ret_type, exceptions=ex_list)
         
+        # Ensure service names don't collide with enums/structs
+        original_svc_name = svc_name
+        if svc_name in global_type_names:
+            suffix = 2
+            while f"{original_svc_name}_{suffix}" in global_type_names:
+                suffix += 1
+            svc_name = f"{original_svc_name}_{suffix}"
+            svc.name = svc_name
+        global_type_names.add(svc_name)
         services[svc_name] = svc
     
     # Add any remaining services from global annotations
@@ -892,25 +994,60 @@ def parse_services():
             ex_list = [ex_type] if ex_type and (ex_type.endswith('Exception') or ex_type in exception_structs) else []
             svc.add_method(mname, arg_type, ret_type, exceptions=ex_list)
         
+        # Ensure service names don't collide with enums/structs
+        original_svc_name = svc_name
+        if svc_name in global_type_names:
+            suffix = 2
+            while f"{original_svc_name}_{suffix}" in global_type_names:
+                suffix += 1
+            svc_name = f"{original_svc_name}_{suffix}"
+            svc.name = svc_name
+        global_type_names.add(svc_name)
         services[svc_name] = svc
 
 def thrift_type_str(field):
     t = field.ttype
-    if t in ('bool','byte','double','i16','i32','i64','string'):
+    if t in ('bool','i8','double','i16','i32','i64','string'):
         if t == 'i32' and field.type_name:
-            return field.type_name
+            # Check if the type_name exists in structs to avoid undefined references
+            if field.type_name in structs:
+                return field.type_name
+            # Otherwise return i32
+            return 'i32'
         return t
     if t == 'struct':
-        return field.type_name or 'i32'
+        # Ensure the struct type exists
+        if field.type_name and field.type_name in structs:
+            return field.type_name
+        return 'i32'
     if t == 'list':
-        elem = normalize_type_name(field.val_type) or normalize_type_name(field.type_name) or 'i32'
+        raw_elem = normalize_type_name(field.val_type) or normalize_type_name(field.type_name) or 'i32'
+        elem = _primitive_to_thrift(raw_elem)
+        # Fallback unknown custom types to i32 to avoid undefined references
+        base_types = {'bool','i8','i16','i32','i64','double','string','binary'}
+        if elem not in base_types and elem not in enums and elem not in structs:
+            elem = 'i32'
         return f'list<{elem}>'
     if t == 'set':
-        elem = normalize_type_name(field.val_type) or normalize_type_name(field.type_name) or 'i32'
+        raw_elem = normalize_type_name(field.val_type) or normalize_type_name(field.type_name) or 'i32'
+        elem = _primitive_to_thrift(raw_elem)
+        base_types = {'bool','i8','i16','i32','i64','double','string','binary'}
+        if elem not in base_types and elem not in enums and elem not in structs:
+            elem = 'i32'
         return f'set<{elem}>'
     if t == 'map':
-        kt = normalize_type_name(field.key_type) or 'i32'
-        vt = normalize_type_name(field.val_type) or 'i32'
+        raw_kt = normalize_type_name(field.key_type) or 'i32'
+        raw_vt = normalize_type_name(field.val_type) or 'i32'
+        kt = _primitive_to_thrift(raw_kt)
+        vt = _primitive_to_thrift(raw_vt)
+        # Thrift map key types must be base types or enums; fallback to i32 if invalid
+        valid_key_bases = {'bool','byte','i8','i16','i32','i64','double','string'}
+        if kt not in valid_key_bases and kt not in enums:
+            kt = 'i32'
+        # Fallback unknown custom value types to i32
+        base_types = {'bool','i8','i16','i32','i64','double','string','binary'}
+        if vt not in base_types and vt not in enums and vt not in structs:
+            vt = 'i32'
         return f'map<{kt},{vt}>'
     if t == 'enum':
         return field.type_name or f'enum {field.name}'
@@ -935,7 +1072,18 @@ def emit_thrift():
     # Type aliases
     if alias_map:
         lines.append('// Type aliases for obfuscated names')
+        seen_aliases = set()
+        # Collect all type names that will be generated
+        all_type_names = set()
+        all_type_names.update(enums.keys())
+        all_type_names.update(st.name for st in structs.values())
+        all_type_names.update(svc.name for svc in services.values())
+        
         for obfuscated, semantic in sorted(alias_map.items()):
+            # Skip duplicates and conflicts with existing types
+            if semantic in seen_aliases or semantic in all_type_names:
+                continue
+            seen_aliases.add(semantic)
             # Emit aliases as i32 to satisfy tests and provide a safe default
             lines.append(f'typedef i32 {semantic}')
         lines.append('')
@@ -943,16 +1091,22 @@ def emit_thrift():
     # Enums
     lines.append('# Enums')
     lines.append('// Enumerations')
+    seen_enum_names = set()
     for ename in sorted(enums.keys()):
         en = enums[ename]
         if not en.values:
             continue
+        # Skip duplicate enum names in output
+        if en.name in seen_enum_names:
+            continue
+        seen_enum_names.add(en.name)
         lines.append(f'enum {en.name} {{')
         seen = set()
         for (n, v) in en.values:
             if n in seen:
                 continue
-            lines.append(f'  {n} = {v},')
+            enum_name = escape_reserved(n)
+            lines.append(f'  {enum_name} = {v},')
             seen.add(n)
         if lines[-1].endswith(','):
             lines[-1] = lines[-1][:-1]
@@ -962,15 +1116,33 @@ def emit_thrift():
     # Structs and Exceptions
     lines.append('# Structs')
     lines.append('// Data structures')
+    seen_struct_names = set()
     for sname in sorted(structs.keys()):
         st = structs[sname]
-        kind = 'exception' if (st.name.endswith('Exception') or st.name in exception_structs) else 'struct'
+        # Skip duplicate struct names in output
+        if st.name in seen_struct_names:
+            continue
+        seen_struct_names.add(st.name)
+        # Treat as exception if recognized by name or tracked as emitted exception
+        kind = 'exception' if (st.name.endswith('Exception') or st.name in exception_structs or st.name in emitted_exception_names) else 'struct'
         lines.append(f'{kind} {st.name} {{')
         if st.fields:
+            # Ensure no duplicate or zero field IDs
+            seen_ids = set()
+            next_id = 1
             for fld in sorted(st.fields, key=lambda f: f.id):
+                # Fix field ID if it's 0 or duplicate
+                if fld.id <= 0 or fld.id in seen_ids:
+                    while next_id in seen_ids:
+                        next_id += 1
+                    fld.id = next_id
+                seen_ids.add(fld.id)
+                next_id = max(next_id, fld.id) + 1
+                
                 tstr = thrift_type_str(fld)
                 req = 'required ' if getattr(fld, 'required', False) else ''
-                lines.append(f'  {fld.id}: {req}{tstr} {fld.name},')
+                field_name = escape_reserved(fld.name)
+                lines.append(f'  {fld.id}: {req}{tstr} {field_name},')
             if lines[-1].endswith(','):
                 lines[-1] = lines[-1][:-1]
         lines.append('}')
@@ -979,8 +1151,13 @@ def emit_thrift():
     # Services
     lines.append('# Services')
     lines.append('// Service definitions')
+    seen_service_names = set()
     for svc_name in sorted(services.keys()):
         svc = services[svc_name]
+        # Skip duplicate service names in output
+        if svc.name in seen_service_names:
+            continue
+        seen_service_names.add(svc.name)
         lines.append(f'service {svc.name} {{')
         for m in svc.methods:
             # Check if return type is obfuscated and map it
@@ -991,11 +1168,45 @@ def emit_thrift():
             arg_type = m['arg_type']
             if arg_type in response_map:
                 arg_type = response_map[arg_type]
+
+            # Final sanity for service signatures: fallback unknown custom types to binary
+            def _sanitize_type(t: str) -> str:
+                if not t:
+                    return 'binary'
+                # containers are already well-formed
+                if '<' in t and '>' in t:
+                    return t
+                base_types = {'bool','i8','i16','i32','i64','double','string','binary','void'}
+                if t in base_types:
+                    return t
+                if t in structs or t in enums:
+                    return t
+                return 'binary'
+
+            arg_type = _sanitize_type(_primitive_to_thrift(arg_type))
+            ret_type = _sanitize_type(_primitive_to_thrift(ret_type))
             
             throws_clause = ''
             if m['exceptions']:
-                throws_clause = ' throws (' + ', '.join([f'1: {ex} ex' for ex in m['exceptions']]) + ')'
-            lines.append(f"  {ret_type} {m['name']}(1: {arg_type} request){throws_clause},")
+                # Only include exceptions that are actually defined in our IDL
+                valid_exceptions = []
+                for ex in m['exceptions']:
+                    if not ex:
+                        continue
+                    # Map original to emitted name if renamed
+                    mapped = exception_name_alias.get(ex, ex)
+                    # Is this emitted as an exception?
+                    if mapped in emitted_exception_names:
+                        valid_exceptions.append(mapped)
+                        continue
+                    # Or if it is a struct we've parsed whose name ends with 'Exception'
+                    if mapped in structs and structs[mapped].name.endswith('Exception'):
+                        valid_exceptions.append(mapped)
+                if valid_exceptions:
+                    # Assign unique field ids in throws clause
+                    throws_clause = ' throws (' + ', '.join([f'{i}: {ex} ex' for i, ex in enumerate(valid_exceptions, start=1)]) + ')'
+            method_name = escape_reserved(m['name'])
+            lines.append(f"  {ret_type} {method_name}(1: {arg_type} request){throws_clause},")
         if lines[-1].endswith(','):
             lines[-1] = lines[-1][:-1]
         lines.append('}')
