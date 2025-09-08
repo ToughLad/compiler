@@ -42,6 +42,13 @@ def escape_reserved(name):
 
 # Configuration (patch-friendly for tests)
 JAVA_ROOT = globals().get('JAVA_ROOT', Path('/workspaces/LINE/line_decompiled/sources'))
+# Optional Smali roots (we'll probe which exist at runtime)
+SMALI_ROOTS = globals().get('SMALI_ROOTS', [
+    Path('/workspaces/LINE/line_decompiled/smali'),
+    Path('/workspaces/LINE/line_decompiled/smali_classes2'),
+    Path('/workspaces/LINE/line_decompiled/smali_classes3'),
+    Path('/workspaces/LINE/line_decompiled/smali_classes4'),
+])
 OUTPUT_FILE = globals().get('OUTPUT_FILE', Path('/workspaces/LINE/line.thrift'))
 
 if not JAVA_ROOT.exists():
@@ -86,6 +93,71 @@ re_kotlin_meta_serviceclient = re.compile(r'"([A-Za-z0-9_.]*ServiceClient)"')
 re_kotlin_meta_method = re.compile(r'm\s*=\s*"([A-Za-z0-9_]+)"')
 re_wrapper_tostring = re.compile(r'new\s+StringBuilder\s*\("([A-Za-z0-9_]+)_(args|result)\(')
 re_b_only = re.compile(r'\bb\("([A-Za-z0-9_]+)"\)')
+
+# --- Smali parsing helpers ---
+# .class public final Lcom/foo/Bar;
+re_smali_class = re.compile(r'^\.class\s+[^\s]+\s+L([A-Za-z0-9_/$]+);', re.MULTILINE)
+# .implements Lorg/apache/thrift/d; (or other single-letter types)
+re_smali_implements_thrift = re.compile(r'^\.implements\s+Lorg/apache/thrift/[a-zA-Z];', re.MULTILINE)
+# .super Lorg/apache/thrift/i; marks exceptions
+re_smali_super_exception = re.compile(r'^\.super\s+Lorg/apache/thrift/i;', re.MULTILINE)
+# const-string v0, "MethodName" ... ->b(
+re_smali_method_tag = re.compile(r'const-string\s+[vp]\d+\s*,\s*"([A-Za-z0-9_]+)"[\s\S]{0,200}?->b\(', re.MULTILINE)
+# const-string v0, "Name_args(" or "Name_result("
+re_smali_wrapper_tostring = re.compile(r'const-string\s+[vp]\d+\s*,\s*"([A-Za-z0-9_]+)_(args|result)\(', re.MULTILINE)
+# const-string "SomethingResponse(" or "SomethingRequest("
+re_smali_response_tostring = re.compile(r'const-string\s+[vp]\d+\s*,\s*"(\w+(?:Response|Request))\(', re.MULTILINE)
+# public instance field type:  .field public a:Lcom/linecorp/Foo;
+re_smali_public_field = re.compile(r'^\s*\.field\s+public\s+\w+:([\[A-Za-z0-9_/$;]+)', re.MULTILINE)
+
+def _smali_desc_to_java_simple(desc: str) -> str:
+    """Convert a smali type descriptor to a simple Java type name.
+    Examples:
+      Ljava/lang/String; -> String
+      Lcom/foo/Bar; -> Bar
+      I -> int, J -> long, S -> short, B -> byte, Z -> boolean, D -> double, F -> float
+      [I or arrays -> binary (fallback)
+    """
+    if not desc:
+        return None
+    d = desc.strip()
+    # Arrays -> treat as binary to be safe
+    if d.startswith('['):
+        return 'binary'
+    # Object
+    if d.startswith('L') and d.endswith(';'):
+        qname = d[1:-1]  # strip L ... ;
+        simple = qname.split('/')[-1]
+        # Strip inner class markers
+        simple = simple.split('$')[-1]
+        if simple == 'String' and 'java/lang' in qname:
+            return 'String'
+        return simple
+    # Primitives
+    prim = {
+        'I': 'int', 'J': 'long', 'S': 'short', 'B': 'byte', 'Z': 'boolean', 'D': 'double', 'F': 'float', 'C': 'char'
+    }
+    return prim.get(d, 'binary')
+
+def _iter_existing_smali_roots():
+    for r in SMALI_ROOTS:
+        if isinstance(r, Path) and r.exists():
+            yield r
+
+def _iter_smali_files():
+    for r in _iter_existing_smali_roots():
+        for p in r.rglob('*.smali'):
+            yield p
+
+def _rel_to_any(p: Path):
+    # Best-effort relative path for stable keys across Java/Smali roots
+    roots = [JAVA_ROOT, *list(_iter_existing_smali_roots())]
+    for root in roots:
+        try:
+            return str(p.relative_to(root))
+        except Exception:
+            continue
+    return str(p)
 
 # Type mapping
 TYPE_MAP = {
@@ -301,28 +373,35 @@ def parse_structs():
     obfuscated_map = {}
     global global_type_names  # Use the global set
     # Don't clear - we need enum names from parse_enums()
+    # Helper to index obfuscated Response/Request names from both Java and Smali
+    def _add_obfuscated_from_java():
+        for p in JAVA_ROOT.rglob('*.java'):
+            s = read_file(p)
+            # Look for toString() that returns Response/Request names (including with fields)
+            toString_patterns = [
+                re.search(r'return\s+"(\w+(?:Response|Request))\(', s),
+                re.search(r'StringBuilder\("(\w+(?:Response|Request))\(', s)
+            ]
+            for match in toString_patterns:
+                if match:
+                    real_name = match.group(1)
+                    try:
+                        obfuscated_key = str(p.relative_to(JAVA_ROOT))
+                    except Exception:
+                        obfuscated_key = str(p)
+                    obfuscated_map[obfuscated_key] = real_name
+                    break
+    def _add_obfuscated_from_smali():
+        for p in _iter_smali_files():
+            s = read_file(p)
+            m = re_smali_response_tostring.search(s)
+            if m:
+                real_name = m.group(1)
+                obfuscated_map[_rel_to_any(p)] = real_name
     
+    _add_obfuscated_from_java()
+    _add_obfuscated_from_smali()
     # First pass: find all obfuscated classes that have Response/Request toString methods
-    for p in JAVA_ROOT.rglob('*.java'):
-        s = read_file(p)
-        # Look for toString() that returns Response/Request names (including with fields)
-        # Pattern 1: return "Name()"
-        # Pattern 2: StringBuilder("Name(field:"
-        toString_patterns = [
-            re.search(r'return\s+"(\w+(?:Response|Request))\(', s),
-            re.search(r'StringBuilder\("(\w+(?:Response|Request))\(', s)
-        ]
-        for match in toString_patterns:
-            if match:
-                real_name = match.group(1)
-                # Use relative path as key to avoid collisions
-                try:
-                    obfuscated_key = str(p.relative_to(JAVA_ROOT))
-                except Exception:
-                    obfuscated_key = str(p)
-                obfuscated_map[obfuscated_key] = real_name
-                break
-    
     print(f"Found {len(obfuscated_map)} obfuscated Response/Request mappings")
     
     # Second pass: parse all structs
@@ -564,6 +643,42 @@ def parse_structs():
             if use_obfuscated_name and ts.fields:
                 print(f"  Added obfuscated class: {p.stem} -> {class_name} with {len(ts.fields)} fields")
 
+    # Third pass: parse smali structs (minimal capture)
+    for p in _iter_smali_files():
+        s = read_file(p)
+        class_name = None
+        mclass = re_smali_class.search(s)
+        if not mclass:
+            continue
+        simple_name = mclass.group(1).split('/')[-1].split('$')[-1]
+        # Prefer deobfuscated Response/Request name if present
+        relk = _rel_to_any(p)
+        if relk in obfuscated_map:
+            class_name = obfuscated_map[relk]
+        else:
+            # Treat as struct if it implements thrift interface, or it's a Response/Request class name
+            if re_smali_implements_thrift.search(s) or simple_name.endswith('Response') or simple_name.endswith('Request'):
+                class_name = simple_name
+            else:
+                continue
+
+        ts = ThriftStruct(class_name)
+        # Minimal: fields from smali are hard; leave empty for now
+        # Exception detection
+        if re_smali_super_exception.search(s) or class_name.endswith('Exception'):
+            exception_structs.add(class_name)
+            emitted_exception_names.add(class_name)
+        # Ensure unique name and register
+        original_name = class_name
+        if class_name in global_type_names or class_name in structs:
+            suffix = 2
+            while (f"{original_name}_{suffix}" in global_type_names or f"{original_name}_{suffix}" in structs):
+                suffix += 1
+            class_name = f"{original_name}_{suffix}"
+            ts.name = class_name
+        global_type_names.add(class_name)
+        structs[class_name] = ts
+
 def parse_services():
     print("Building class index...")
     global class_index
@@ -573,16 +688,17 @@ def parse_services():
             class_index[str(rel_path)] = jp
         except Exception:
             class_index[str(jp)] = jp
+    # Include smali files in class index
+    for sp in _iter_smali_files():
+        class_index[_rel_to_any(sp)] = sp
     
     # Build mapping from obfuscated class names to response/request types
     def build_class_to_response_map():
         """Build mapping from obfuscated class names like X3 to response/request names"""
         response_map = {}
+        # Java
         for p in JAVA_ROOT.rglob('*.java'):
             s = read_file(p)
-            # Look for toString patterns that reveal the actual Response/Request name
-            # Pattern 1: return "Name()"
-            # Pattern 2: StringBuilder("Name(field:"
             toString_patterns = [
                 re.search(r'return\s+"(\w+(?:Response|Request))\(', s),
                 re.search(r'StringBuilder\("(\w+(?:Response|Request))\(', s)
@@ -590,13 +706,18 @@ def parse_services():
             for match in toString_patterns:
                 if match:
                     real_name = match.group(1)
-                    # Use relative path as key to avoid collisions
                     try:
                         rel_path = str(p.relative_to(JAVA_ROOT))
                     except Exception:
                         rel_path = str(p)
                     response_map[rel_path] = real_name
                     break
+        # Smali
+        for sp in _iter_smali_files():
+            s = read_file(sp)
+            m = re_smali_response_tostring.search(s)
+            if m:
+                response_map[_rel_to_any(sp)] = m.group(1)
         return response_map
 
     global response_map
@@ -616,16 +737,36 @@ def parse_services():
             kind = wm.group(2)
             if kind == 'args' and mname not in method_to_args_wrapper:
                 method_to_args_wrapper[mname] = jp.stem
-                # Create alias
                 if jp.stem in structs:
                     alias_name = camel_case(mname) + 'Request'
                     alias_map[jp.stem] = alias_name
             elif kind == 'result' and mname not in method_to_result_wrapper:
                 method_to_result_wrapper[mname] = jp.stem
-                # Create alias for response type
                 if jp.stem in structs:
-                    # Find the success field type
                     struct = structs[jp.stem]
+                    for field in struct.fields:
+                        if field.name in ('success', 'result', 'f0'):
+                            if field.type_name and field.type_name in structs:
+                                alias_name = camel_case(mname) + 'Response'
+                                alias_map[field.type_name] = alias_name
+                            break
+    # Smali wrappers
+    for sp in _iter_smali_files():
+        sws = read_file(sp)
+        if not sws:
+            continue
+        for wm in re_smali_wrapper_tostring.finditer(sws):
+            mname = wm.group(1)
+            kind = wm.group(2)
+            if kind == 'args' and mname not in method_to_args_wrapper:
+                method_to_args_wrapper[mname] = Path(sp).stem
+                if Path(sp).stem in structs:
+                    alias_name = camel_case(mname) + 'Request'
+                    alias_map[Path(sp).stem] = alias_name
+            elif kind == 'result' and mname not in method_to_result_wrapper:
+                method_to_result_wrapper[mname] = Path(sp).stem
+                if Path(sp).stem in structs:
+                    struct = structs[Path(sp).stem]
                     for field in struct.fields:
                         if field.name in ('success', 'result', 'f0'):
                             if field.type_name and field.type_name in structs:
@@ -919,6 +1060,125 @@ def parse_services():
             svc.name = svc_name
         global_type_names.add(svc_name)
         services[svc_name] = svc
+
+    # Smali-based service parsing
+    for sp in _iter_smali_files():
+        s = read_file(sp)
+        if not s:
+            continue
+        # A service-like client typically has $Client or ServiceClient in class name, or calls ->b("...")
+        has_tag = bool(re_smali_method_tag.search(s))
+        class_m = re_smali_class.search(s)
+        if not class_m and not has_tag:
+            continue
+        base_simple = class_m.group(1).split('/')[-1].split('$')[-1] if class_m else Path(sp).stem
+        if ('ServiceClient' not in base_simple and '$' not in class_m.group(1) and not has_tag):
+            continue
+        svc_name = base_simple
+        # Normalize like Java path
+        if svc_name.endswith('ServiceClient'):
+            svc_name = svc_name[:-len('Client')]
+        elif svc_name.endswith('ClientImpl'):
+            base = svc_name[:-len('ClientImpl')]
+            svc_name = base if base.endswith('Service') else base + 'Service'
+        # If the raw class name contains $Client, strip it
+        if '$' in class_m.group(1):
+            raw = class_m.group(1).split('/')[-1]
+            if '$Client' in raw:
+                svc_name = raw.split('$')[0]
+        # Filter clearly-non-service generated classes
+        if not (has_tag or svc_name.endswith('Service')):
+            continue
+
+        svc = services.get(svc_name) or ThriftService(svc_name)
+
+        # Collect method tags from smali
+        names = set(m.group(1) for m in re_smali_method_tag.finditer(s))
+
+        # Try to enrich from wrappers discovered globally
+        # (Kotlin meta not present in smali)
+
+        method_to_arg = {}
+        method_to_ret_ex = {}
+
+        # Resolve arg/ret via wrappers
+        for mname in list(names):
+            # Arg via args wrapper
+            aw = method_to_args_wrapper.get(mname)
+            if aw and not method_to_arg.get(mname):
+                # Search in class_index (java or smali)
+                for path_key, path in class_index.items():
+                    if Path(path).stem == aw:
+                        wsrc = read_file(path)
+                        if path.suffix == '.java':
+                            pf = re_public_field.search(wsrc)
+                            if pf:
+                                method_to_arg[mname] = normalize_type_name(pf.group(1))
+                        else:
+                            sm = re_smali_public_field.search(wsrc)
+                            if sm:
+                                method_to_arg[mname] = normalize_type_name(_smali_desc_to_java_simple(sm.group(1)))
+                        break
+            # Ret via result wrapper
+            rw = method_to_result_wrapper.get(mname)
+            ret_type = None
+            ex_type = None
+            if rw:
+                for path_key, path in class_index.items():
+                    if Path(path).stem == rw:
+                        wsrc = read_file(path)
+                        if path.suffix == '.java':
+                            fields = re_public_field.findall(wsrc)
+                            for t, fname in fields[:5]:
+                                nt = normalize_type_name(t)
+                                if not nt:
+                                    continue
+                                if nt.endswith('Exception') or nt in exception_structs:
+                                    if not ex_type:
+                                        ex_type = nt
+                                else:
+                                    if not ret_type:
+                                        ret_type = nt
+                        else:
+                            # Smali public fields
+                            sfields = re_smali_public_field.findall(wsrc)
+                            for d in sfields[:5]:
+                                nt = normalize_type_name(_smali_desc_to_java_simple(d))
+                                if not nt:
+                                    continue
+                                if nt.endswith('Exception') or nt in exception_structs:
+                                    if not ex_type:
+                                        ex_type = nt
+                                else:
+                                    if not ret_type:
+                                        ret_type = nt
+                        break
+            if ret_type or ex_type:
+                method_to_ret_ex[mname] = (ret_type, ex_type)
+
+        # Emit methods
+        for mname in sorted(names):
+            arg_type = method_to_arg.get(mname) or 'binary'
+            ret_type, ex_type = method_to_ret_ex.get(mname, (None, None))
+            if not ret_type:
+                # Infer from name if we have a matching Response struct
+                expected_response = mname[0].upper() + mname[1:] + 'Response'
+                if expected_response in structs:
+                    ret_type = expected_response
+            if ret_type is None:
+                ret_type = 'void'
+            ex_list = [ex_type] if ex_type and (ex_type.endswith('Exception') or ex_type in exception_structs) else []
+            svc.add_method(mname, arg_type, ret_type, exceptions=ex_list)
+
+        # Ensure unique service name & register
+        original_svc_name = svc_name
+        if svc.name in global_type_names:
+            suffix = 2
+            while f"{original_svc_name}_{suffix}" in global_type_names:
+                suffix += 1
+            svc.name = f"{original_svc_name}_{suffix}"
+        global_type_names.add(svc.name)
+        services[svc.name] = svc
     
     # Add any remaining services from global annotations
     for svc_name, methods in service_to_methods.items():
