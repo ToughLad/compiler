@@ -1,5 +1,6 @@
 import unittest
 from src.thrift_compiler import normalize_type_name, camel_case, Field, thrift_type_str
+from src import thrift_compiler
 
 class TestUtils(unittest.TestCase):
 
@@ -22,10 +23,13 @@ class TestUtils(unittest.TestCase):
         field = Field(1, 'test', 'bool')
         self.assertEqual(thrift_type_str(field), 'bool')
         
+        # If a custom type is present for i32, it must exist in structs
+        thrift_compiler.structs['MyEnum'] = thrift_compiler.ThriftStruct('MyEnum')
         field = Field(1, 'test', 'i32', type_name='MyEnum')
         self.assertEqual(thrift_type_str(field), 'MyEnum')
         
         # Struct
+        thrift_compiler.structs['MyStruct'] = thrift_compiler.ThriftStruct('MyStruct')
         field = Field(1, 'test', 'struct', type_name='MyStruct')
         self.assertEqual(thrift_type_str(field), 'MyStruct')
         
